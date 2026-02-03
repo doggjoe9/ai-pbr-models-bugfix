@@ -5,6 +5,7 @@ import torch
 import json
 import logging
 import time
+import re
 from torchvision.transforms import functional as TF
 import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
@@ -983,9 +984,10 @@ def predirect_pbr_maps(
 
 
 # Find and process normal + diffuse pairs inside 'textures'
-file_list_n = list(TEXTURES_DIR.glob("**/*_n.dds"))
-file_list_norm = list(TEXTURES_DIR.glob("**/*_norm.dds"))
-file_list_normal = list(TEXTURES_DIR.glob("**/*_normal.dds"))
+# case_sensitive requires Python 3.12+
+file_list_n = list(TEXTURES_DIR.glob("**/*_n.dds", case_sensitive=False))
+file_list_norm = list(TEXTURES_DIR.glob("**/*_norm.dds", case_sensitive=False))
+file_list_normal = list(TEXTURES_DIR.glob("**/*_normal.dds", case_sensitive=False))
 final_list = sorted(file_list_n + file_list_norm + file_list_normal)
 total_found = len(final_list)
 processed_ok = 0
@@ -994,33 +996,53 @@ skipped_missing_diffuse = 0
 
 logging.info(f"Scanning '{TEXTURES_DIR}' for normal maps: found {total_found}")
 
+# Regex for matching suffixes.
+regex_normal = re.compile(r"_n$|_norm$|_normal$", flags=re.IGNORECASE)
+regex_diffuse = re.compile(r"_d$|_diff$|_diffuse$", flags=re.IGNORECASE)
+regex_glow = re.compile(r"_g$|_glow$", flags=re.IGNORECASE)
 for normal_path in final_list:
-    basename = normal_path.stem
-    if basename.endswith("_n"):
-        basename = basename[:-2]
-    elif basename.endswith("_norm"):
-        basename = basename[:-5]
-    elif basename.endswith("_normal"):
-        basename = basename[:-7]
+    # basename = normal_path.stem without the _n, _norm, or _normal suffix
+    basename = regex_normal.sub("", normal_path.stem)
+    
+    # Sentinel values for texture paths. If anything goes wrong the pair is skipped after the loop.
+    diffuse_path = None
+    glow_path = None
 
-    diffuse_path = normal_path.with_name(basename + "_d.dds")
-    if not diffuse_path.exists():
-        diffuse_path = normal_path.with_name(basename + ".dds")
-    if not diffuse_path.exists():
-        diffuse_path = normal_path.with_name(basename + "_diff.dds")
-    if not diffuse_path.exists():
-        diffuse_path = normal_path.with_name(basename + "_diffuse.dds")
-
-    glow_path = normal_path.with_name(basename + "_g.dds")
-    if not glow_path.exists():
-        glow_path = normal_path.with_name(basename + "_glow.dds")
-    if not glow_path.exists():
-        glow_path = None
-
-    if not diffuse_path.exists():
-        logging.warning(
-            f"Skipping {normal_path} - diffuse not found (_d.dds .dds _diff.dds _diffuse.dds)"
-        )
+    # Sentinel value to stop looking for glowmaps if multiple are found.
+    glow_allowed = True
+    # For each file in the same directory as the normal map, check if its stem (without diffuse suffixes) matches the basename.
+    for potential_sibling in normal_path.parent.iterdir():
+        potential_sibling_stem = potential_sibling.stem
+        # Check for diffuse.
+        # Replace the diffuse suffixes with an empty string and compare lowercase to ensure case insensitivity.
+        # regex.sub returns the original string if no match is found to allow matching basename.dds as well.
+        if regex_diffuse.sub("", potential_sibling_stem).lower() == basename.lower():
+            # If this is the first match, set diffuse_path. If it's not the first match, log a warning and skip this normal map.
+            if diffuse_path is None:
+                diffuse_path = potential_sibling
+            else:
+                # In case the folder contains multiple diffuse textures with the same basename, or on case-sensitive filesystems,
+                # the same name but different casing.
+                logging.warning(f"Multiple diffuse textures matching basename {basename} ({diffuse_path.stem} and {potential_sibling.stem}). Skipping.")
+                diffuse_path = None
+                break
+        # Check for glow.
+        # No shortcut like for diffuse since glow must have a suffix.
+        # Check if the potential_stem has a glow suffix and the rest of the stem matches the basename.
+        if glow_allowed and regex_glow.match(potential_sibling_stem) and regex_glow.sub("", potential_sibling_stem).lower() == basename.lower():
+            # If this is the first match, set glow_path. If it's not the first match, log a warning and skip glowmap.
+            if glow_path is None:
+                glow_path = potential_sibling
+            else:
+                # In case the folder contains multiple glow textures with the same basename, or on case-sensitive filesystems,
+                # the same name but different casing.
+                logging.warning(f"Multiple glow textures matching basename {basename} ({glow_path.stem} and {potential_sibling.stem}). Ignoring glowmap.")
+                glow_path = None
+                glow_allowed = False
+    
+    # Make sure a matching diffuse texture was found
+    if diffuse_path is None or not diffuse_path.exists():
+        logging.warning(f"Skipping {normal_path} - diffuse not found (_d.dds .dds _diff.dds _diffuse.dds)")
         skipped_missing_diffuse += 1
         continue
 
